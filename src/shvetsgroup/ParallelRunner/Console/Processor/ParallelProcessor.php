@@ -13,6 +13,7 @@ use Symfony\Component\DependencyInjection\ContainerInterface,
   Symfony\Component\Console\Input\InputInterface,
   Symfony\Component\Console\Input\InputOption,
   Symfony\Component\Console\Output\OutputInterface;
+use shvetsgroup\ParallelRunner\Console\Command\ParallelRunnerCommand;
 
 /**
  * Parallel runner parameters processor.
@@ -62,12 +63,13 @@ class ParallelProcessor extends Processor
      */
     public function process(InputInterface $input, OutputInterface $output)
     {
+        /** @var ParallelRunnerCommand $command */
         $command = $this->container->get('behat.console.command');
         if ($input->getOption('worker')) {
-            $data = unserialize($input->getOption('worker'));
-            $command->setWorkerID($data['workerID']);
-            $command->setSuiteID($data['suiteID']);
-            $command->setProcessCount($data['processCount']);
+            $data = json_decode($input->getOption('worker'));
+            $command->setWorkerID($data->workerID)
+                    ->setProcessCount($data->processCount)
+                    ->setSessionID($data->sessionID);
         } else {
             if ($input->getOption('parallel')) {
                 if (is_numeric($input->getOption('parallel'))) {

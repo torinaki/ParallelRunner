@@ -38,7 +38,7 @@ class Extension implements ExtensionInterface
           ->addArgument('Event recorder for events handled by a Gearman worker.')
           ->addTag('behat.formatter.dispatcher');
         $container
-          ->register('behat.gearman.service.event', '\shvetsgroup\ParallelRunner\Service\EventService')
+          ->register('parallel.service.event', '\shvetsgroup\ParallelRunner\Service\EventService')
           ->addArgument(new Reference('behat.event_dispatcher'));
 
         $container->setParameter('parallel.process_count', $config['process_count']);

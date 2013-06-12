@@ -9,12 +9,17 @@ namespace shvetsgroup\ParallelRunner\Console\Command;
 use Behat\Behat\Console\Command\BehatCommand,
   Behat\Behat\Event\SuiteEvent;
 
+use Behat\Behat\DataCollector\LoggerDataCollector;
+use Behat\Gherkin\Gherkin;
+use shvetsgroup\ParallelRunner\Service\EventService;
+use Symfony\Component\Config\Definition\Exception\Exception;
 use Symfony\Component\DependencyInjection\ContainerInterface,
   Symfony\Component\Console\Input\InputOption,
   Symfony\Component\Console\Input\InputInterface,
   Symfony\Component\Console\Output\OutputInterface,
   Symfony\Component\Process\Process;
-
+use Symfony\Component\EventDispatcher\Event;
+use Symfony\Component\EventDispatcher\EventDispatcher;
 
 /**
  * Behat parallel runner client console command
@@ -44,6 +49,16 @@ class ParallelRunnerCommand extends BehatCommand
     protected $suiteID;
 
     /**
+     * @var string Session ID generated and provided by parent process
+     */
+    protected $sessionID;
+
+    /**
+     * @var string Path where exchanged data between parent and child processes will be stored
+     */
+    protected $resultDir;
+
+    /**
      * {@inheritdoc}
      */
     protected function execute(InputInterface $input, OutputInterface $output)
@@ -70,15 +85,16 @@ class ParallelRunnerCommand extends BehatCommand
      */
     protected function runParallel(InputInterface $input)
     {
-        $eventService = $this->getContainer()->get('behat.gearman.service.event');
-        $this->suiteID = time() . '-' . rand(1, PHP_INT_MAX);
-        $result_dir = sys_get_temp_dir() . '/behat-' . $this->suiteID;
-        if (!is_dir($result_dir)) {
-            mkdir($result_dir);
-        }
+        $this->initDataExchange();
+
+        /** @var EventService $eventService */
+        $eventService = $this->getContainer()->get('parallel.service.event');
 
         // Prepare parameters string.
-        $command_template = array('XDEBUG_CONFIG="idekey=apache" ' . realpath($_SERVER['SCRIPT_FILENAME']));
+        $env = 'export QUERY_STRING="start_debug=1&debug_stop=1&debug_fastfile=1&debug_coverage=1&use_remote=1
+    &send_sess_end=1&debug_session_id=2000&debug_start_session=1&debug_port=10137&debug_host=91.221.62.112" && export PHP_IDE_CONFIG="serverName=dmitryb.d.intexsys.lv"';
+        $env = 'export QUERY_STRING="start_debug=0"';
+        $command_template = array($env . ' && ' . realpath($_SERVER['SCRIPT_FILENAME']));
         foreach ($input->getArguments() as $argument) {
             $command_template[] = $argument;
         }
@@ -97,8 +113,12 @@ class ParallelRunnerCommand extends BehatCommand
         $profiles = $this->getContainer()->getParameter('parallel.profiles');
         for ($i = 0; $i < $this->processCount; $i++) {
             $command = $command_template;
-            $worker_data = serialize(
-                array('workerID' => $i, 'suiteID' => $this->suiteID, 'processCount' => $this->processCount)
+            $worker_data = json_encode(
+                array(
+                    'workerID' => $i,
+                    'processCount' => $this->processCount,
+                    'sessionID' => $this->getSessionID(),
+                )
             );
             $command[] = "--worker='$worker_data'";
             if (isset($profiles[$i])) {
@@ -113,25 +133,24 @@ class ParallelRunnerCommand extends BehatCommand
         $this->registerParentSignal();
 
         // Print test results while workers do the testing job.
-        while (count($this->processes) > 0) {
+
+        // FIXES: This is container for all events. Unfortunately if any of event's object will be destructed,
+        // than selenium session will be closed(selenium session of child process "magically" unserialized from
+        // fetched data). So to prevent such behavior we need keep all objects till
+        // all tests will be end. !!! This fix may be a subject of lot memory usage. !!!
+        $events = array();
+        do {
+
             sleep(1);
 
-            // Process events, dumped by children processes (in other words, do the formatting job).
-            $files = glob($result_dir . '/*', GLOB_BRACE);
-            foreach ($files as $file) {
-                $events = unserialize(file_get_contents($file));
-                $eventService->replay($events);
-                unlink($file);
+            if ($_events = $this->fetchData()) {
+                $events = array_merge($events, $_events);
+                $eventService->replay($_events);
             }
 
-            // Dismiss finished processes.
-            foreach ($this->processes as $i => $process) {
-                if (!$this->processes[$i]->isRunning()) {
-                    unset($this->processes[$i]);
-                }
-            }
-        }
-        rmdir($result_dir);
+        } while ($this->calculateRunningProcessCount() > 0);
+
+        $this->closeDataExchange();
     }
 
     /**
@@ -139,6 +158,8 @@ class ParallelRunnerCommand extends BehatCommand
      */
     protected function runWorker()
     {
+        $this->initDataExchange();
+
         $this->registerWorkerSignal();
 
         // We don't need any formatters, but event recorder for worker process.
@@ -146,9 +167,10 @@ class ParallelRunnerCommand extends BehatCommand
         $formatterManager->disableFormatters();
         $formatterManager->initFormatter('recorder');
 
-
+        /** @var Gherkin $gherkin */
         $gherkin = $this->getContainer()->get('gherkin');
-        $eventService = $this->getContainer()->get('behat.gearman.service.event');
+        /** @var EventService $eventService */
+        $eventService = $this->getContainer()->get('parallel.service.event');
 
         $feature_count = 1;
         foreach ($this->getFeaturesPaths() as $path) {
@@ -161,17 +183,63 @@ class ParallelRunnerCommand extends BehatCommand
                     $tester->setDryRun($this->isDryRun());
                     $feature->accept($tester);
 
-                    $output_file = sys_get_temp_dir() . '/behat-' . $this->suiteID . '/' . str_replace(
-                          '/',
-                          '_',
-                          $feature->getFile()
-                      );
-                    file_put_contents($output_file, serialize($eventService->getEvents()));
+                    $this->storeData($feature, $eventService->getEvents());
+
                     $eventService->flushEvents();
                 }
                 $feature_count++;
             }
         }
+    }
+
+    protected function calculateRunningProcessCount()
+    {
+        foreach ($this->processes as $i => $process) {
+            if (!$this->processes[$i]->isRunning()) {
+                unset($this->processes[$i]);
+            }
+        }
+        return count($this->processes);
+    }
+
+    protected function initDataExchange()
+    {
+        if (!$this->isSetSessionId()) {
+            $sessionId = time() . '-' . rand(1, PHP_INT_MAX);
+            $this->setSessionID($sessionId);
+        }
+
+        $this->resultDir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'behat-' . $this->getSessionID();
+        if (!is_dir($this->resultDir)) {
+            mkdir($this->resultDir);
+        }
+    }
+
+    protected function closeDataExchange()
+    {
+        rmdir($this->resultDir);
+    }
+
+    protected function storeData($feature, array $events)
+    {
+        $file = str_replace('/', '_', $feature->getFile());
+        file_put_contents($this->resultDir . DIRECTORY_SEPARATOR . $file, serialize($events));
+    }
+
+    /**
+     * Process events, dumped by children processes (in other words, do the formatting job).
+     * @param integer $processNumber
+     * @return Event[]
+     */
+    protected function fetchData($processNumber = null)
+    {
+        $events = array();
+        $files = glob($this->resultDir . '/*', GLOB_BRACE);
+        foreach ($files as $file) {
+            $events = array_merge($events, unserialize(file_get_contents($file)));
+            unlink($file);
+        }
+        return $events;
     }
 
     /**
@@ -208,7 +276,9 @@ class ParallelRunnerCommand extends BehatCommand
     protected function registerWorkerSignal()
     {
         if (function_exists('pcntl_signal')) {
+            /** @var EventDispatcher $logger */
             $dispatcher = $this->getContainer()->get('behat.event_dispatcher');
+            /** @var LoggerDataCollector $logger */
             $logger = $this->getContainer()->get('behat.logger');
             $parameters = $this->getContainer()->get('behat.context.dispatcher')->getContextParameters();
 
@@ -223,26 +293,50 @@ class ParallelRunnerCommand extends BehatCommand
     }
 
     /**
-     * @var bool Number of parallel processes.
+     * @param bool Number of parallel processes.
+     * @return ParallelRunnerCommand
      */
     public function setProcessCount($value)
     {
         $this->processCount = $value;
+        return $this;
     }
 
     /**
-     * @var bool Whether or not run the test as worker.
+     * @param bool Whether or not run the test as worker.
+     * @return ParallelRunnerCommand
      */
     public function setWorkerID($value)
     {
         $this->workerID = $value;
+        return $this;
     }
 
     /**
-     * @var bool Whether or not run the test as worker.
+     * @param string $sessionID
+     * @return ParallelRunnerCommand
      */
-    public function setSuiteID($value)
+    public function setSessionID($sessionID)
     {
-        $this->suiteID = $value;
+        $this->sessionID = $sessionID;
+        return $this;
+    }
+
+    /**
+     * Session ID will be auto generated if not set
+     * @throws Exception
+     * @return string
+     */
+    protected function getSessionID()
+    {
+        if (null === $this->sessionID) {
+            throw new Exception('Session ID not provided');
+        }
+        return $this->sessionID;
+    }
+
+    protected function isSetSessionId()
+    {
+        return (bool)$this->sessionID;
     }
 }
