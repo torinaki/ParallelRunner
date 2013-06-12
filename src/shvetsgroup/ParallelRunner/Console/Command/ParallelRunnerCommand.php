@@ -179,6 +179,10 @@ class ParallelRunnerCommand extends BehatCommand
      */
     protected function registerParentSignal()
     {
+        if (!function_exists('pcntl_signal')) {
+            trigger_error('PCNTL extension not installed. Child processes can\'t be terminated properly', E_USER_WARNING);
+            return;
+        }
         $dispatcher = $this->getContainer()->get('behat.event_dispatcher');
         $logger = $this->getContainer()->get('behat.logger');
         $parameters = $this->getContainer()->get('behat.context.dispatcher')->getContextParameters();
