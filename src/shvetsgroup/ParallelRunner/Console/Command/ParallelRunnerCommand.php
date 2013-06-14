@@ -1,8 +1,4 @@
 <?php
-/**
- * @copyright 2013 Alexander Shvets
- * @license MIT
- */
 
 namespace shvetsgroup\ParallelRunner\Console\Command;
 
@@ -10,8 +6,13 @@ use Behat\Behat\Console\Command\BehatCommand,
   Behat\Behat\Event\SuiteEvent;
 
 use Behat\Behat\DataCollector\LoggerDataCollector;
+use Behat\Behat\Event\FeatureEvent;
+use Behat\Behat\Formatter\FormatterManager;
+use Behat\Behat\Tester\FeatureTester;
+use Behat\Behat\Tester\ScenarioTester;
 use Behat\Gherkin\Gherkin;
-use shvetsgroup\ParallelRunner\Service\EventService;
+use Behat\Gherkin\Node\FeatureNode;
+use Behat\Gherkin\Node\ScenarioNode;
 use Symfony\Component\Config\Definition\Exception\Exception;
 use Symfony\Component\DependencyInjection\ContainerInterface,
   Symfony\Component\Console\Input\InputOption,
@@ -21,11 +22,6 @@ use Symfony\Component\DependencyInjection\ContainerInterface,
 use Symfony\Component\EventDispatcher\Event;
 use Symfony\Component\EventDispatcher\EventDispatcher;
 
-/**
- * Behat parallel runner client console command
- *
- * @author Alexander Shvets <apang@softwaredevelopment.ca>
- */
 class ParallelRunnerCommand extends BehatCommand
 {
     /**
@@ -34,14 +30,14 @@ class ParallelRunnerCommand extends BehatCommand
     protected $processCount = 1;
 
     /**
-     * @var array of Process classes.
+     * @var Process[]
      */
     protected $processes = array();
 
     /**
      * @var int Worker ID.
      */
-    protected $workerID;
+    protected $workerId;
 
     /**
      * @var string Suite ID.
@@ -51,19 +47,21 @@ class ParallelRunnerCommand extends BehatCommand
     /**
      * @var string Session ID generated and provided by parent process
      */
-    protected $sessionID;
+    protected $sessionId;
 
     /**
      * @var string Path where exchanged data between parent and child processes will be stored
      */
-    protected $resultDir;
+    protected $outputPath;
+
+    protected $fileOffsets = array();
 
     /**
      * {@inheritdoc}
      */
     protected function execute(InputInterface $input, OutputInterface $output)
     {
-        if (isset($this->workerID)) {
+        if (isset($this->workerId)) {
             $this->runWorker();
 
             return $this->getCliReturnCode();
@@ -85,10 +83,10 @@ class ParallelRunnerCommand extends BehatCommand
      */
     protected function runParallel(InputInterface $input)
     {
-        $this->initDataExchange();
 
-        /** @var EventService $eventService */
-        $eventService = $this->getContainer()->get('parallel.service.event');
+        // We don't need any formatters, but event recorder for worker process.
+        $formatterManager = $this->getContainer()->get('behat.formatter.manager');
+        $formatterManager->disableFormatters();
 
         // Prepare parameters string.
         $env = 'export QUERY_STRING="start_debug=1&debug_stop=1&debug_fastfile=1&debug_coverage=1&use_remote=1
@@ -115,9 +113,9 @@ class ParallelRunnerCommand extends BehatCommand
             $command = $command_template;
             $worker_data = json_encode(
                 array(
-                    'workerID' => $i,
+                    'workerId' => $i,
                     'processCount' => $this->processCount,
-                    'sessionID' => $this->getSessionID(),
+                    'sessionId' => $this->getSessionId(),
                 )
             );
             $command[] = "--worker='$worker_data'";
@@ -132,25 +130,17 @@ class ParallelRunnerCommand extends BehatCommand
         // catch app interruption
         $this->registerParentSignal();
 
-        // Print test results while workers do the testing job.
-
-        // FIXES: This is container for all events. Unfortunately if any of event's object will be destructed,
-        // than selenium session will be closed(selenium session of child process "magically" unserialized from
-        // fetched data). So to prevent such behavior we need keep all objects till
-        // all tests will be end. !!! This fix may be a subject of lot memory usage. !!!
-        $events = array();
-        do {
-
+        $time = microtime(true);
+        // Wait while all behat processes will done their job and show output
+        while ($this->calculateRunningProcessCount() > 0) {
             sleep(1);
+            $this->printOutput();
+        }
+        $time = microtime(true) - $time;
 
-            if ($_events = $this->fetchData()) {
-                $events = array_merge($events, $_events);
-                $eventService->replay($_events);
-            }
+        $this->printSummary($time);
 
-        } while ($this->calculateRunningProcessCount() > 0);
-
-        $this->closeDataExchange();
+        // TODO: Must XML JUnit files must be merged
     }
 
     /**
@@ -158,38 +148,53 @@ class ParallelRunnerCommand extends BehatCommand
      */
     protected function runWorker()
     {
-        $this->initDataExchange();
-
         $this->registerWorkerSignal();
-
-        // We don't need any formatters, but event recorder for worker process.
+        /** @var FormatterManager $formatterManager */
         $formatterManager = $this->getContainer()->get('behat.formatter.manager');
-        $formatterManager->disableFormatters();
-        $formatterManager->initFormatter('recorder');
+        $formatterManager->setFormattersParameter('output_path', $this->getOutputPath());
+        $formatterManager->setFormattersParameter('worker_id', $this->getWorkerId());
 
         /** @var Gherkin $gherkin */
         $gherkin = $this->getContainer()->get('gherkin');
-        /** @var EventService $eventService */
-        $eventService = $this->getContainer()->get('parallel.service.event');
+        /** @var ScenarioTester $tester */
+        $tester = $this->getContainer()->get('behat.tester.scenario');
+        $tester->setDryRun($this->isDryRun());
 
-        $feature_count = 1;
+        $dispatcher = $this->getContainer()->get('behat.event_dispatcher');
+        $contextParameters = $this->getContainer()->get('behat.context.dispatcher')->getContextParameters();
+
+        // TODO: Move all this logic to custom FeatureTester class
         foreach ($this->getFeaturesPaths() as $path) {
-            // Run the tests and record the events.
-            $eventService->flushEvents();
+
+            $scenarioCount = 1;
+            /** @var FeatureNode[] $features */
             $features = $gherkin->load((string) $path);
+
             foreach ($features as $feature) {
-                if (($feature_count % $this->processCount) == $this->workerID) {
-                    $tester = $this->getContainer()->get('behat.tester.feature');
-                    $tester->setDryRun($this->isDryRun());
-                    $feature->accept($tester);
-
-                    $this->storeData($feature, $eventService->getEvents());
-
-                    $eventService->flushEvents();
+                $dispatcher->dispatch(
+                    'beforeFeature', new FeatureEvent($feature, $contextParameters)
+                );
+                /** @var ScenarioNode[] $scenarios */
+                $scenarios = $feature->getScenarios();
+                foreach ($scenarios as $scenario) {
+                    if (($scenarioCount % $this->processCount) == $this->workerId) {
+                        $scenario->accept($tester);
+                    }
+                    $scenarioCount++;
                 }
-                $feature_count++;
+                $dispatcher->dispatch(
+                    'afterFeature', new FeatureEvent($feature, $contextParameters)
+                );
             }
         }
+    }
+
+    protected function printSummary($time)
+    {
+        $minutes    = floor($time / 60);
+        $seconds    = round($time - ($minutes * 60), 3);
+
+        echo PHP_EOL . $minutes . 'm' . $seconds . 's' . PHP_EOL;
     }
 
     protected function calculateRunningProcessCount()
@@ -202,44 +207,37 @@ class ParallelRunnerCommand extends BehatCommand
         return count($this->processes);
     }
 
-    protected function initDataExchange()
-    {
-        if (!$this->isSetSessionId()) {
-            $sessionId = time() . '-' . rand(1, PHP_INT_MAX);
-            $this->setSessionID($sessionId);
-        }
-
-        $this->resultDir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'behat-' . $this->getSessionID();
-        if (!is_dir($this->resultDir)) {
-            mkdir($this->resultDir);
-        }
-    }
-
     protected function closeDataExchange()
     {
-        rmdir($this->resultDir);
+        rmdir($this->outputPath);
     }
 
-    protected function storeData($feature, array $events)
+    public function getOutputPath()
     {
-        $file = str_replace('/', '_', $feature->getFile());
-        file_put_contents($this->resultDir . DIRECTORY_SEPARATOR . $file, serialize($events));
+        if (null === $this->outputPath) {
+            $this->outputPath = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'behat-' . $this->getSessionId();
+            if (!is_dir($this->outputPath)) {
+                mkdir($this->outputPath);
+            }
+        }
+        return $this->outputPath;
     }
 
     /**
      * Process events, dumped by children processes (in other words, do the formatting job).
-     * @param integer $processNumber
      * @return Event[]
      */
-    protected function fetchData($processNumber = null)
+    protected function printOutput()
     {
-        $events = array();
-        $files = glob($this->resultDir . '/*', GLOB_BRACE);
+        $files = glob($this->getOutputPath() . '/TEST-*', GLOB_BRACE);
         foreach ($files as $file) {
-            $events = array_merge($events, unserialize(file_get_contents($file)));
-            unlink($file);
+            if (!isset($this->fileOffsets[$file])) {
+                $this->fileOffsets[$file] = 0;
+            }
+            $output = file_get_contents($file, false, null, $this->fileOffsets[$file]);
+            $this->fileOffsets[$file] += strlen($output);
+            echo $output;
         }
-        return $events;
     }
 
     /**
@@ -306,19 +304,24 @@ class ParallelRunnerCommand extends BehatCommand
      * @param bool Whether or not run the test as worker.
      * @return ParallelRunnerCommand
      */
-    public function setWorkerID($value)
+    public function setWorkerId($value)
     {
-        $this->workerID = $value;
+        $this->workerId = $value;
         return $this;
+    }
+
+    public function getWorkerId()
+    {
+        return $this->workerId;
     }
 
     /**
      * @param string $sessionID
      * @return ParallelRunnerCommand
      */
-    public function setSessionID($sessionID)
+    public function setSessionId($sessionID)
     {
-        $this->sessionID = $sessionID;
+        $this->sessionId = $sessionID;
         return $this;
     }
 
@@ -327,16 +330,48 @@ class ParallelRunnerCommand extends BehatCommand
      * @throws Exception
      * @return string
      */
-    protected function getSessionID()
+    protected function getSessionId()
     {
-        if (null === $this->sessionID) {
-            throw new Exception('Session ID not provided');
+        if (null === $this->sessionId) {
+            if ($this->isWorker()) {
+                throw new Exception('Session ID not provided');
+            }
+            $this->sessionId = time() . '-' . rand(1, PHP_INT_MAX);
         }
-        return $this->sessionID;
+        return $this->sessionId;
     }
 
     protected function isSetSessionId()
     {
-        return (bool)$this->sessionID;
+        return (bool)$this->sessionId;
+    }
+
+    protected function isWorker()
+    {
+        return (null !== $this->workerId);
+    }
+
+    public static function getFileName(FeatureNode $feature)
+    {
+        return 'TEST-' . basename($feature->getFile(), '.feature') . '.txt';
+    }
+
+    private function cleanTemporaryData()
+    {
+        $path = $this->getOutputPath();
+        $files = glob($path . '/*', GLOB_BRACE);
+        foreach ($files as $file) {
+            unlink($file);
+        }
+        if (is_dir($path)) {
+            rmdir($path);
+        }
+    }
+
+    public function __destruct()
+    {
+        if (!$this->isWorker()) {
+            $this->cleanTemporaryData();
+        }
     }
 }

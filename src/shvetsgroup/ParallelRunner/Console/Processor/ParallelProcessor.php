@@ -67,9 +67,9 @@ class ParallelProcessor extends Processor
         $command = $this->container->get('behat.console.command');
         if ($input->getOption('worker')) {
             $data = json_decode($input->getOption('worker'));
-            $command->setWorkerID($data->workerID)
+            $command->setWorkerId($data->workerId)
                     ->setProcessCount($data->processCount)
-                    ->setSessionID($data->sessionID);
+                    ->setSessionId($data->sessionId);
         } else {
             if ($input->getOption('parallel')) {
                 if (is_numeric($input->getOption('parallel'))) {

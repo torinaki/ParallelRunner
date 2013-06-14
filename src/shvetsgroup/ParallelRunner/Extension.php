@@ -20,6 +20,10 @@ class Extension implements ExtensionInterface
      */
     public function load(array $config, ContainerBuilder $container)
     {
+        // do not load extension at all if not set parallel processes count
+        if ($config['process_count'] < 2) {
+            return;
+        }
         $container->setParameter(
             'behat.console.command.class',
             '\shvetsgroup\ParallelRunner\Console\Command\ParallelRunnerCommand'
@@ -31,18 +35,23 @@ class Extension implements ExtensionInterface
           )
           ->addArgument(new Reference('service_container'))
           ->addTag('behat.console.processor');
-        $container
-          ->register('behat.formatter.dispatcher.recorder', '\Behat\Behat\Formatter\FormatterDispatcher')
-          ->addArgument('shvetsgroup\ParallelRunner\Formatter\EventRecorder')
-          ->addArgument('recorder')
-          ->addArgument('Event recorder for events handled by a Gearman worker.')
-          ->addTag('behat.formatter.dispatcher');
+
+        $this->initFormatters($config, $container);
         $container
           ->register('parallel.service.event', '\shvetsgroup\ParallelRunner\Service\EventService')
           ->addArgument(new Reference('behat.event_dispatcher'));
 
         $container->setParameter('parallel.process_count', $config['process_count']);
         $container->setParameter('parallel.profiles', $config['profiles']);
+    }
+
+    public function initFormatters(array $config, ContainerBuilder $container)
+    {
+        // TODO: remove not supported formatters
+        $container->setParameter('behat.formatter.classes', array(
+            'junit' => '\shvetsgroup\ParallelRunner\Formatter\JUnitFormatter',
+            'progress' => '\shvetsgroup\ParallelRunner\Formatter\ProgressFormatter',
+        ));
     }
 
     /**
@@ -56,7 +65,7 @@ class Extension implements ExtensionInterface
         $builder
             ->children()
                 ->scalarNode('process_count')
-                    ->defaultValue(1)
+                    ->defaultValue(2)
                 ->end()
                 ->arrayNode('profiles')
                     ->defaultValue(array())
